@@ -7,3 +7,7 @@ From the root folder
 
 ### Run the image
 
+* ```docker run -it --rm -v $(pwd):/app satis_ai bash```
+
+### Instructions
+The main function is `schedule_orders` in 'order_scheduler.py`
