@@ -71,11 +71,11 @@ def read_branch_info(branch_info_line):
         bacon_number = branch_info_split
 
     cooking_data = {"capacity": int(cooking_capacity.replace("C", "")),
-                    "lead_time": int(cooking_time)},
+                    "lead_time": int(cooking_time)}
     assembling_data = {"capacity": int(assembling_capacity.replace("A", "")),
-                       "lead_time": int(assembling_time)},
+                       "lead_time": int(assembling_time)}
     packaging_data = {"capacity": int(packaging_capacity.replace("P", "")),
-                      "lead_time": int(packaging_time)},
+                      "lead_time": int(packaging_time)}
     inventory = {"burgers_patties": int(burgers_number),
                  "lettuce": int(lettuce_number),
                  "tomato": int(tomato_number),
@@ -104,7 +104,6 @@ def read_order_info(order_info_line):
 
     # remove new line
     hamburgers_list_no_new_line = [hamburger.rstrip("\n") for hamburger in hamburgers_list]
-    print(hamburgers_list_no_new_line)
 
     return Order(branch_id=branch_id,
                  date_time=date_time,

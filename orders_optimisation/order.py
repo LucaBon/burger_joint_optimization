@@ -50,7 +50,6 @@ class Order:
         return self.burgers_number
 
     def calculate_order_ingredients(self):
-        print(self.burgers)
         order_ingredients = {"burgers_patties": 0,
                              "lettuce": 0,
                              "tomato": 0,

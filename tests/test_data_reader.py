@@ -1,6 +1,6 @@
 import unittest
 import logging
-import os
+
 
 import orders_optimisation.data_reader as ut
 

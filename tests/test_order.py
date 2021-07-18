@@ -1,6 +1,6 @@
 import unittest
 import logging
-import os
+
 
 import orders_optimisation.order as ut
 
@@ -62,5 +62,4 @@ class TestOrder(unittest.TestCase):
                          hamburgers=["BLT", "LT", "VLT"])
         ingredients = order.calculate_order_ingredients()
         self.assertIsInstance(ingredients, dict)
-        print(ingredients)
         self.assertDictEqual(ingredients, correct_output)
