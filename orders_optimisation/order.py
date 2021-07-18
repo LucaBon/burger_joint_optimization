@@ -16,6 +16,15 @@ class Order:
                  date_time,
                  order_id,
                  hamburgers):
+        """
+
+        Args:
+            branch_id (str): the ID of the branch
+            date_time (str): date and time formatted as follows '%Y-%m-%d %H:%M:%S'
+            order_id (str): the ID of the order
+            hamburgers (list): contains the hamburgers associated to the order. For example ["BLT", "VLT"].
+                               Only B, V, L, T are allowed
+        """
 
         self._check_input(branch_id, date_time, hamburgers, order_id)
 
