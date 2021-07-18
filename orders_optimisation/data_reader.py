@@ -104,6 +104,7 @@ def read_order_info(order_info_line):
 
     # remove new line
     hamburgers_list_no_new_line = [hamburger.rstrip("\n") for hamburger in hamburgers_list]
+    print(hamburgers_list_no_new_line)
 
     return Order(branch_id=branch_id,
                  date_time=date_time,

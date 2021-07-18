@@ -35,7 +35,32 @@ class TestOrder(unittest.TestCase):
         order = ut.Order(branch_id="R1",
                          date_time="2020-12-08 19:15:31",
                          order_id="O1",
-                         hamburgers=["BLT,LT,VLT"])
+                         hamburgers=["BLT", "LT", "VLT"])
         limit_time = order.calculate_limit_time()
         self.assertIsInstance(limit_time, str)
         self.assertEqual(limit_time, correct_output)
+
+    def test_calculate_burger_number(self):
+        correct_output = 3
+        order = ut.Order(branch_id="R1",
+                         date_time="2020-12-08 19:15:31",
+                         order_id="O1",
+                         hamburgers=["BLT", "LT", "VLT"])
+        burger_number = order.calculate_burgers_number()
+        self.assertIsInstance(burger_number, int)
+        self.assertEqual(burger_number, correct_output)
+
+    def test_calculate_order_ingredients(self):
+        correct_output = {"burgers_patties": 2,
+                          "lettuce": 3,
+                          "tomato": 3,
+                          "veggie_patties": 1,
+                          "bacon": 1}
+        order = ut.Order(branch_id="R1",
+                         date_time="2020-12-08 19:15:31",
+                         order_id="O1",
+                         hamburgers=["BLT", "LT", "VLT"])
+        ingredients = order.calculate_order_ingredients()
+        self.assertIsInstance(ingredients, dict)
+        print(ingredients)
+        self.assertDictEqual(ingredients, correct_output)

@@ -5,6 +5,7 @@ from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
+
 class Order:
 
     # each order should be processed within 20 minutes
@@ -49,6 +50,7 @@ class Order:
         return self.burgers_number
 
     def calculate_order_ingredients(self):
+        print(self.burgers)
         order_ingredients = {"burgers_patties": 0,
                              "lettuce": 0,
                              "tomato": 0,
@@ -57,21 +59,20 @@ class Order:
         for burger in self.burgers:
             if "V" not in burger:
                 order_ingredients["burgers_patties"] += 1
-            else:
-                for ingredient in burger:
-                    if ingredient == "L":
-                        order_ingredients["lettuce"] += 1
-                    elif ingredient == "T":
-                        order_ingredients["tomato"] += 1
-                    elif ingredient == "B":
-                        order_ingredients["bacon"] += 1
-                    elif ingredient == "V":
-                        order_ingredients["veggie_patties"] += 1
-                    else:
-                        raise InvalidIngredientError("The order contains the following invalid ingredient: {}"
-                                              "".format(ingredient))
 
-
+            for ingredient in burger:
+                if ingredient == "L":
+                    order_ingredients["lettuce"] += 1
+                if ingredient == "T":
+                    order_ingredients["tomato"] += 1
+                if ingredient == "B":
+                    order_ingredients["bacon"] += 1
+                if ingredient == "V":
+                    order_ingredients["veggie_patties"] += 1
+                elif ingredient not in ["L", "T", "B", "V"]:
+                    raise InvalidIngredientError("The order contains the following invalid ingredient: {}"
+                                                 "".format(ingredient))
+        return order_ingredients
 
     def are_ingredients_in_inventory(self):
         pass
