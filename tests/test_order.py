@@ -2,7 +2,7 @@ import unittest
 import logging
 
 
-import orders_optimisation.order as ut
+import burger_joint_optimization.orders_optimisation.order as ut
 
 formatter = logging.Formatter(
     '%(asctime)s : %(name)s : %(levelname)s : %(message)s'
@@ -19,10 +19,12 @@ class TestOrder(unittest.TestCase):
     def test_input(self):
         # Check TypeError is correctly raised
 
-        branch_id = [[], {}, 1]
-        date_time = [0., 3, [8]]
-        order_id = [[], {}, 0.]
-        hamburgers = [0, 1.7, {}]
+        branch_id = [[], "", ""]
+        date_time = ["", 3, ""]
+        order_id = ["", "", ""]
+        hamburgers = [[],
+                      [],
+                      {}]
         for b, d, o, h in zip(branch_id, date_time, order_id, hamburgers):
             with self.assertRaises(TypeError):
                 ut.Order(branch_id=b,
@@ -35,17 +37,26 @@ class TestOrder(unittest.TestCase):
         order = ut.Order(branch_id="R1",
                          date_time="2020-12-08 19:15:31",
                          order_id="O1",
-                         hamburgers=["BLT", "LT", "VLT"])
+                         hamburgers=[])
         limit_time = order.calculate_limit_time()
         self.assertIsInstance(limit_time, str)
         self.assertEqual(limit_time, correct_output)
 
     def test_calculate_burger_number(self):
         correct_output = 3
+        order_id = "O1"
+        hamburgers_list = ["BLT", "LT", "VLT"]
+        hamburgers_items = []
+        for i, burger in enumerate(hamburgers_list):
+            hamburgers_items.append(
+                ut.Item(order_id=order_id,
+                        item_id=i,
+                        ingredients=burger)
+            )
         order = ut.Order(branch_id="R1",
                          date_time="2020-12-08 19:15:31",
-                         order_id="O1",
-                         hamburgers=["BLT", "LT", "VLT"])
+                         order_id=order_id,
+                         hamburgers=hamburgers_items)
         burger_number = order.calculate_burgers_number()
         self.assertIsInstance(burger_number, int)
         self.assertEqual(burger_number, correct_output)
@@ -56,10 +67,19 @@ class TestOrder(unittest.TestCase):
                           "tomato": 3,
                           "veggie_patties": 1,
                           "bacon": 1}
+        order_id = "O1"
+        hamburgers_list = ["BLT", "LT", "VLT"]
+        hamburgers_items = []
+        for i, burger in enumerate(hamburgers_list):
+            hamburgers_items.append(
+                ut.Item(order_id=order_id,
+                        item_id=i,
+                        ingredients=burger)
+            )
         order = ut.Order(branch_id="R1",
                          date_time="2020-12-08 19:15:31",
-                         order_id="O1",
-                         hamburgers=["BLT", "LT", "VLT"])
+                         order_id=order_id,
+                         hamburgers=hamburgers_items)
         ingredients = order.calculate_order_ingredients()
         self.assertIsInstance(ingredients, dict)
         self.assertDictEqual(ingredients, correct_output)

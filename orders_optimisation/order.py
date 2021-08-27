@@ -22,8 +22,8 @@ class Order:
             branch_id (str): the ID of the branch
             date_time (str): date and time formatted as follows '%Y-%m-%d %H:%M:%S'
             order_id (str): the ID of the order
-            hamburgers (list): contains the hamburgers associated to the order. For example ["BLT", "VLT"].
-                               Only B, V, L, T are allowed
+            hamburgers (list[Item]): contains the hamburgers associated to the
+             order.
         """
 
         self._check_input(branch_id, date_time, hamburgers, order_id)
@@ -65,10 +65,10 @@ class Order:
                              "veggie_patties": 0,
                              "bacon": 0}
         for burger in self.burgers:
-            if "V" not in burger:
+            if "V" not in burger.ingredients:
                 order_ingredients["burgers_patties"] += 1
 
-            for ingredient in burger:
+            for ingredient in burger.ingredients:
                 if ingredient == "L":
                     order_ingredients["lettuce"] += 1
                 if ingredient == "T":
@@ -78,12 +78,29 @@ class Order:
                 if ingredient == "V":
                     order_ingredients["veggie_patties"] += 1
                 elif ingredient not in ["L", "T", "B", "V"]:
-                    raise InvalidIngredientError("The order contains the following invalid ingredient: {}"
+                    raise InvalidIngredientError("The order contains the "
+                                                 "following invalid ingredient"
+                                                 ": {}"
                                                  "".format(ingredient))
         return order_ingredients
 
     def are_ingredients_in_inventory(self):
         pass
+
+
+class Item:
+    def __init__(self, order_id, item_id, ingredients):
+        """
+
+        Args:
+            order_id(str):
+            item_id(int):
+            ingredients(str): A string of ingredients. For example: "BLT".
+             Only B, V, L, T are allowed
+        """
+        self.order_id = order_id
+        self.item_id = item_id
+        self.ingredients = ingredients
 
 
 class InvalidIngredientError(ValueError):

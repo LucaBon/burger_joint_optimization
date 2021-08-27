@@ -2,8 +2,8 @@ import logging
 import re
 import os
 
-from orders_optimisation.order import Order
-from orders_optimisation.branch import Branch
+from burger_joint_optimization.orders_optimisation.order import Order, Item
+from burger_joint_optimization.orders_optimisation.branch import Branch
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +18,9 @@ def is_branch_info_line(line):
         bool: whether or not the line contains valid branch info
     """
 
-    branch_info_format = re.compile("^R[0-9]+,[0-9]+C,[0-9]+,[0-9]+A,[0-9]+,[0-9]+P,[0-9]+,[0-9]+,[0-9]+,[0-9]+,"
-                                    "[0-9]+,[0-9]+$")
+    branch_info_format = \
+        re.compile("^R[0-9]+,[0-9]+C,[0-9]+,[0-9]+A,[0-9]+,[0-9]+P,[0-9]+,"
+                   "[0-9]+,[0-9]+,[0-9]+,[0-9]+,[0-9]+$")
     match = re.match(branch_info_format, line)
     if match is not None:
         return True
@@ -37,7 +38,8 @@ def is_order_info_line(line):
         bool: whether or not the line contains valid order info
     """
     order_format = re.compile("^R[0-9]+,[0-9]{4}-[0-1][0-9]-[0-3][0-9] "
-                              "[0-2][0-9]:[0-5][0-9]:[0-5][0-9],O[0-9]+(,[BLTV]+)+$")
+                              "[0-2][0-9]:[0-5][0-9]:[0-5][0-9],O[0-9]+"
+                              "(,[BLTV]+)+$")
 
     match = re.match(order_format, line)
     if match is not None:
@@ -103,17 +105,31 @@ def read_order_info(order_info_line):
     branch_id, date_time, order_id, *hamburgers_list = order_info_split
 
     # remove new line
-    hamburgers_list_no_new_line = [hamburger.rstrip("\n") for hamburger in hamburgers_list]
+    hamburgers_list_no_new_line = [hamburger.rstrip("\n") for hamburger
+                                   in hamburgers_list]
+
+    items_list = create_items(hamburgers_list_no_new_line, order_id)
 
     return Order(branch_id=branch_id,
                  date_time=date_time,
                  order_id=order_id,
-                 hamburgers=hamburgers_list_no_new_line)
+                 hamburgers=items_list)
+
+
+def create_items(hamburgers_list_no_new_line, order_id):
+    items_list = []
+    for i, ingredients in enumerate(hamburgers_list_no_new_line):
+        hamburger = Item(order_id=order_id,
+                         item_id=i,
+                         ingredients=ingredients)
+        items_list.append(hamburger)
+    return items_list
 
 
 def read_input_txt(path_to_txt_file):
     """
-    It reads the input txt file and return a tuple containing branches info and orders info
+    It reads the input txt file and return a tuple containing branches info and
+     orders info
 
     Args:
         path_to_txt_file (str):
@@ -141,26 +157,33 @@ def read_input_txt(path_to_txt_file):
                     branches_list.append(branch)
                     orders_dict[branch.branch_id] = []
                 else:
-                    raise DuplicatedBranchIdError("The branch id {} already exists".format(branch.branch_id))
+                    raise DuplicatedBranchIdError("The branch id {} already"
+                                                  " exists".format(branch.branch_id))
 
             if is_order_info_line(line):
                 order = read_order_info(line)
                 if order.branch_id in orders_dict:
                     orders_dict[order.branch_id].append(order)
                 else:
-                    raise NoBranchInfoError("The order created with id {} refers to the branch {} "
-                                            "for which no info are present".format(order.order_id, order.branch_id))
+                    raise NoBranchInfoError("The order created with id {} "
+                                            "refers to the branch {} "
+                                            "for which no info are present"
+                                            "".format(order.order_id,
+                                                      order.branch_id))
 
     return branches_list, orders_dict
 
 
 def _check_read_input_txt(path_to_orders_file):
     if not isinstance(path_to_orders_file, str):
-        raise TypeError("path_to_orders_file should be a str, while it is {}".format(type(path_to_orders_file)))
+        raise TypeError("path_to_orders_file should be a str, while it is"
+                        " {}".format(type(path_to_orders_file)))
     if not os.path.isfile(path_to_orders_file):
-        raise ValueError("path_to_orders_file {} does not exist or is not a file".format(path_to_orders_file))
+        raise ValueError("path_to_orders_file {} does not exist or is not a"
+                         " file".format(path_to_orders_file))
     if not path_to_orders_file.endswith(".txt"):
-        raise ValueError("path_to_orders_file should have a .txt extension while it is {}".format(path_to_orders_file))
+        raise ValueError("path_to_orders_file should have a .txt extension "
+                         "while it is {}".format(path_to_orders_file))
 
 
 class DuplicatedBranchIdError(ValueError):
