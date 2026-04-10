@@ -1,64 +1,574 @@
 import logging
-import queue
+import os
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 
-from burger_joint_optimization.orders_optimisation import data_reader
+from .order import InvalidIngredientError, Order
+from .branch import Branch, ExhaustedIngredientError
+from . import data_reader
 
 
 logger = logging.getLogger(__name__)
 
+DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
-def schedule(branches, orders):
+TIER_ON_TIME = 0
+TIER_LATE = 1
+
+
+@dataclass
+class BurgerAssignment:
+    order_id: str
+    item_id: int
+    ingredients: str
+    tier: int
+    cook_worker: int
+    cook_start: datetime
+    cook_end: datetime
+    asm_worker: int
+    asm_start: datetime
+    asm_end: datetime
+    pkg_worker: int
+    pkg_start: datetime
+    pkg_end: datetime
+
+
+@dataclass
+class _OrderMeta:
+    order: Order
+    arrival: datetime
+    deadline: datetime
+    tier: int
+    status: str
+
+
+@dataclass
+class AdmissionVerdict:
+    feasible: bool
+    projected_end: datetime
+    lateness: timedelta
+    displaced_orders: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AdmissionResult:
+    status: str  # "accepted" | "accepted_late" | "rejected"
+    verdict: AdmissionVerdict
+    schedule: List[BurgerAssignment] = field(default_factory=list)
+    reason: Optional[str] = None
+
+
+class BranchScheduler:
+    """Online deadline-aware scheduler for a single branch.
+
+    Orders are admitted one at a time via :meth:`admit`. Each admission
+    triggers a full re-optimization of all not-yet-started work using an
+    EDF dispatch rule at burger granularity, split into two priority tiers:
+
+    - **Tier 0 (on-time):** orders admitted with a feasible verdict.
+    - **Tier 1 (accepted-late):** orders admitted despite infeasibility.
+      They are dispatched strictly after all tier-0 work at every stage.
+
+    Burgers whose cooking has already started at ``now`` are frozen and
+    never reassigned. Inventory is decremented inside :meth:`admit` — the
+    read-only :meth:`estimate` never mutates state.
+    """
+
+    def __init__(self, branch: Branch):
+        self._branch = branch
+        self._order_meta: Dict[str, _OrderMeta] = {}
+        self._assignments: Dict[str, List[BurgerAssignment]] = {}
+        self._rejected: List[dict] = []
+
+        self._cook_lead = timedelta(minutes=branch.cooking["lead_time"])
+        self._asm_lead = timedelta(minutes=branch.assembling["lead_time"])
+        self._pkg_lead = timedelta(minutes=branch.packaging["lead_time"])
+        self._cook_cap = branch.cooking["capacity"]
+        self._asm_cap = branch.assembling["capacity"]
+        self._pkg_cap = branch.packaging["capacity"]
+
+    # ----- public API -----
+
+    def estimate(self, order: Order, now: datetime) -> AdmissionVerdict:
+        """Project the effect of admitting ``order`` at tier 0 without mutating state."""
+        baseline = self._simulate(now=now)
+        projected = self._simulate(
+            now=now, new_order=order, new_tier=TIER_ON_TIME)
+
+        new_end = _projected_end(projected, order.order_id)
+        deadline = now + timedelta(
+            minutes=order.max_order_completion_time)
+        feasible = new_end <= deadline
+        lateness = new_end - deadline if new_end > deadline else timedelta(0)
+
+        displaced: List[str] = []
+        for oid, meta in self._order_meta.items():
+            if meta.tier != TIER_ON_TIME:
+                continue
+            base_end = _projected_end(baseline, oid)
+            new_end_other = _projected_end(projected, oid)
+            if base_end <= meta.deadline < new_end_other:
+                displaced.append(oid)
+
+        return AdmissionVerdict(
+            feasible=feasible,
+            projected_end=new_end,
+            lateness=lateness,
+            displaced_orders=displaced,
+        )
+
+    def admit_moore_hodgson(self, order: Order, now: datetime,
+                            accept_late: bool = True) -> AdmissionResult:
+        """Admit ``order`` using Moore-Hodgson demotion.
+
+        Classical Moore-Hodgson minimizes the number of tardy jobs by
+        removing the longest-processing-time job from the on-time set
+        whenever a newcomer would otherwise make it tardy. This online
+        variant keeps the newcomer on tier-0 whenever possible and
+        demotes existing tier-0 orders (longest first, measured in
+        burger count) to tier-1 until the newcomer fits. Demoted orders
+        keep their inventory and schedule slots but lose tier-0
+        priority, so they are dispatched strictly after tier-0 work.
+
+        If demotion cannot make the newcomer feasible, all demotions are
+        rolled back and the normal ``admit`` fallback applies.
+        """
+        if order.order_id in self._order_meta:
+            raise ValueError(
+                "order {} already admitted".format(order.order_id))
+
+        try:
+            required = order.calculate_order_ingredients()
+        except InvalidIngredientError as exc:
+            return self._record_rejection(
+                order, "invalid_ingredient: {}".format(exc))
+
+        if not _inventory_covers(self._branch.inventory, required):
+            return self._record_rejection(order, "inventory_exhausted")
+
+        verdict = self.estimate(order, now)
+        if verdict.feasible and not verdict.displaced_orders:
+            return self._commit(order, now, required,
+                                TIER_ON_TIME, "accepted", verdict)
+
+        # Track original (tier, status) so we can roll back on failure.
+        saved: List[tuple] = []
+
+        def _demote(oid: str) -> None:
+            meta = self._order_meta[oid]
+            saved.append((oid, meta.tier, meta.status))
+            meta.tier = TIER_LATE
+            meta.status = "demoted_mh"
+
+        # First demote anything the estimate says we'd displace.
+        for oid in verdict.displaced_orders:
+            if self._order_meta[oid].tier == TIER_ON_TIME:
+                _demote(oid)
+
+        # Then demote remaining tier-0 orders longest-first until the
+        # newcomer fits.
+        def _remaining_candidates() -> List[str]:
+            return sorted(
+                (oid for oid, m in self._order_meta.items()
+                 if m.tier == TIER_ON_TIME),
+                key=lambda oid: (
+                    -len(self._order_meta[oid].order.burgers), oid))
+
+        new_verdict = self.estimate(order, now)
+        while (not new_verdict.feasible or new_verdict.displaced_orders):
+            cands = _remaining_candidates()
+            if not cands:
+                break
+            _demote(cands[0])
+            new_verdict = self.estimate(order, now)
+
+        if new_verdict.feasible and not new_verdict.displaced_orders:
+            return self._commit(order, now, required,
+                                TIER_ON_TIME, "accepted_mh", new_verdict)
+
+        # Roll back demotions and fall through to the classic path.
+        for oid, tier, status in saved:
+            meta = self._order_meta[oid]
+            meta.tier = tier
+            meta.status = status
+
+        if accept_late:
+            return self._commit(order, now, required,
+                                TIER_LATE, "accepted_late", verdict)
+
+        reason = ("deadline_infeasible" if not verdict.feasible
+                  else "would_displace")
+        self._rejected.append({
+            "order_id": order.order_id,
+            "reason": reason,
+            "lateness_seconds": int(verdict.lateness.total_seconds()),
+            "displaced_orders": list(verdict.displaced_orders),
+        })
+        return AdmissionResult(
+            status="rejected", verdict=verdict, reason=reason)
+
+    def _commit(self, order: Order, now: datetime, required: dict,
+                tier: int, status: str,
+                verdict: AdmissionVerdict) -> AdmissionResult:
+        """Shared commit path for :meth:`admit` and :meth:`admit_moore_hodgson`."""
+        self._branch.remove_ingredients_from_inventory(required)
+        self._order_meta[order.order_id] = _OrderMeta(
+            order=order,
+            arrival=now,
+            deadline=now + timedelta(
+                minutes=order.max_order_completion_time),
+            tier=tier,
+            status=status,
+        )
+        self._assignments = self._simulate(
+            now=now, new_order=order, new_tier=tier)
+        return AdmissionResult(
+            status=status if status != "accepted_mh" else "accepted",
+            verdict=verdict,
+            schedule=list(self._assignments[order.order_id]),
+        )
+
+    def admit(self, order: Order, now: datetime,
+              accept_late: bool = False) -> AdmissionResult:
+        """Attempt to admit ``order``.
+
+        ``accept_late=True`` forces acceptance even when the estimate is
+        infeasible or would displace existing tier-0 orders; infeasible
+        orders are committed at tier 1 so they cannot starve tier-0 work.
+        """
+        if order.order_id in self._order_meta:
+            raise ValueError(
+                "order {} already admitted".format(order.order_id))
+
+        try:
+            required = order.calculate_order_ingredients()
+        except InvalidIngredientError as exc:
+            return self._record_rejection(order, "invalid_ingredient: {}".format(exc))
+
+        if not _inventory_covers(self._branch.inventory, required):
+            return self._record_rejection(order, "inventory_exhausted")
+
+        verdict = self.estimate(order, now)
+
+        if verdict.feasible and not verdict.displaced_orders:
+            tier, status = TIER_ON_TIME, "accepted"
+        elif accept_late:
+            if verdict.feasible:
+                tier, status = TIER_ON_TIME, "accepted"
+            else:
+                tier, status = TIER_LATE, "accepted_late"
+        else:
+            reason = "deadline_infeasible" if not verdict.feasible else "would_displace"
+            self._rejected.append({
+                "order_id": order.order_id,
+                "reason": reason,
+                "lateness_seconds": int(verdict.lateness.total_seconds()),
+                "displaced_orders": list(verdict.displaced_orders),
+            })
+            return AdmissionResult(
+                status="rejected", verdict=verdict, reason=reason)
+
+        self._branch.remove_ingredients_from_inventory(required)
+        self._order_meta[order.order_id] = _OrderMeta(
+            order=order,
+            arrival=now,
+            deadline=now + timedelta(
+                minutes=order.max_order_completion_time),
+            tier=tier,
+            status=status,
+        )
+        self._assignments = self._simulate(
+            now=now, new_order=order, new_tier=tier)
+
+        return AdmissionResult(
+            status=status,
+            verdict=verdict,
+            schedule=list(self._assignments[order.order_id]),
+        )
+
+    def snapshot(self) -> dict:
+        """Return a batch-shaped view compatible with the legacy API."""
+        orders_out = []
+        for oid, meta in sorted(
+                self._order_meta.items(),
+                key=lambda kv: (kv[1].arrival, kv[0])):
+            burgers = self._assignments.get(oid, [])
+            if not burgers:
+                continue
+            end = max(b.pkg_end for b in burgers)
+            orders_out.append({
+                "order_id": oid,
+                "start": meta.arrival,
+                "end": end,
+                "limit": meta.deadline,
+                "on_time": end <= meta.deadline,
+                "tier": meta.tier,
+                "status": meta.status,
+                "burgers": [_burger_to_dict(b) for b in burgers],
+            })
+        return {"orders": orders_out, "skipped": list(self._rejected)}
+
+    # ----- internals -----
+
+    def _record_rejection(self, order: Order, reason: str) -> AdmissionResult:
+        self._rejected.append({"order_id": order.order_id, "reason": reason})
+        return AdmissionResult(
+            status="rejected",
+            verdict=AdmissionVerdict(
+                feasible=False,
+                projected_end=datetime.min,
+                lateness=timedelta(0),
+            ),
+            reason=reason,
+        )
+
+    def _simulate(self,
+                  now: datetime,
+                  new_order: Optional[Order] = None,
+                  new_tier: int = TIER_ON_TIME
+                  ) -> Dict[str, List[BurgerAssignment]]:
+        """Produce a fresh per-order assignment dict reflecting the current
+        plan plus (optionally) a hypothetical new order.
+
+        Freezing is **per stage**: a burger whose cook has started is locked
+        at cook, but its assembly and packaging can still be reassigned by
+        a higher-priority newcomer. This is what lets a late-arriving
+        tier-0 order jump the assembly queue past a tier-1 burger that is
+        done cooking but has not yet been assembled.
+        """
+        states: List[dict] = []
+
+        for oid, burgers in self._assignments.items():
+            meta = self._order_meta[oid]
+            for ba in burgers:
+                states.append({
+                    "tier": meta.tier,
+                    "deadline": meta.deadline,
+                    "arrival": meta.arrival,
+                    "oid": oid,
+                    "item_id": ba.item_id,
+                    "ingredients": ba.ingredients,
+                    "cook_frozen": ba.cook_start <= now,
+                    "asm_frozen": ba.asm_start <= now,
+                    "pkg_frozen": ba.pkg_start <= now,
+                    "cook_worker": ba.cook_worker,
+                    "cook_start": ba.cook_start,
+                    "cook_end": ba.cook_end,
+                    "asm_worker": ba.asm_worker,
+                    "asm_start": ba.asm_start,
+                    "asm_end": ba.asm_end,
+                    "pkg_worker": ba.pkg_worker,
+                    "pkg_start": ba.pkg_start,
+                    "pkg_end": ba.pkg_end,
+                })
+
+        if new_order is not None:
+            new_deadline = now + timedelta(
+                minutes=new_order.max_order_completion_time)
+            for item in new_order.burgers:
+                states.append({
+                    "tier": new_tier,
+                    "deadline": new_deadline,
+                    "arrival": now,
+                    "oid": new_order.order_id,
+                    "item_id": item.item_id,
+                    "ingredients": item.ingredients,
+                    "cook_frozen": False,
+                    "asm_frozen": False,
+                    "pkg_frozen": False,
+                    "cook_worker": -1,
+                    "cook_start": None,
+                    "cook_end": None,
+                    "asm_worker": -1,
+                    "asm_start": None,
+                    "asm_end": None,
+                    "pkg_worker": -1,
+                    "pkg_start": None,
+                    "pkg_end": None,
+                })
+
+        cook_free = [now] * self._cook_cap
+        asm_free = [now] * self._asm_cap
+        pkg_free = [now] * self._pkg_cap
+
+        for s in states:
+            if s["cook_frozen"] and s["cook_end"] > cook_free[s["cook_worker"]]:
+                cook_free[s["cook_worker"]] = s["cook_end"]
+            if s["asm_frozen"] and s["asm_end"] > asm_free[s["asm_worker"]]:
+                asm_free[s["asm_worker"]] = s["asm_end"]
+            if s["pkg_frozen"] and s["pkg_end"] > pkg_free[s["pkg_worker"]]:
+                pkg_free[s["pkg_worker"]] = s["pkg_end"]
+
+        states.sort(key=lambda s: (
+            s["tier"], s["deadline"], s["arrival"], s["oid"], s["item_id"]))
+
+        for s in states:
+            if not s["cook_frozen"]:
+                ci = _earliest_idx(cook_free)
+                not_before = s["arrival"]
+                cs = cook_free[ci] if cook_free[ci] > not_before else not_before
+                ce = cs + self._cook_lead
+                cook_free[ci] = ce
+                s["cook_worker"] = ci
+                s["cook_start"] = cs
+                s["cook_end"] = ce
+
+            if not s["asm_frozen"]:
+                ai = _earliest_idx(asm_free)
+                cook_end = s["cook_end"]
+                as_ = asm_free[ai] if asm_free[ai] > cook_end else cook_end
+                ae = as_ + self._asm_lead
+                asm_free[ai] = ae
+                s["asm_worker"] = ai
+                s["asm_start"] = as_
+                s["asm_end"] = ae
+
+            if not s["pkg_frozen"]:
+                pi = _earliest_idx(pkg_free)
+                asm_end = s["asm_end"]
+                ps = pkg_free[pi] if pkg_free[pi] > asm_end else asm_end
+                pe = ps + self._pkg_lead
+                pkg_free[pi] = pe
+                s["pkg_worker"] = pi
+                s["pkg_start"] = ps
+                s["pkg_end"] = pe
+
+        grouped: Dict[str, List[BurgerAssignment]] = {}
+        for s in states:
+            ba = BurgerAssignment(
+                order_id=s["oid"],
+                item_id=s["item_id"],
+                ingredients=s["ingredients"],
+                tier=s["tier"],
+                cook_worker=s["cook_worker"],
+                cook_start=s["cook_start"],
+                cook_end=s["cook_end"],
+                asm_worker=s["asm_worker"],
+                asm_start=s["asm_start"],
+                asm_end=s["asm_end"],
+                pkg_worker=s["pkg_worker"],
+                pkg_start=s["pkg_start"],
+                pkg_end=s["pkg_end"],
+            )
+            grouped.setdefault(ba.order_id, []).append(ba)
+        for oid in grouped:
+            grouped[oid].sort(key=lambda b: b.item_id)
+        return grouped
+
+
+# ----- helpers -----
+
+
+def _earliest_idx(workers: List[datetime]) -> int:
+    best = 0
+    for i in range(1, len(workers)):
+        if workers[i] < workers[best]:
+            best = i
+    return best
+
+
+def _projected_end(plan: Dict[str, List[BurgerAssignment]],
+                   order_id: str) -> datetime:
+    burgers = plan.get(order_id)
+    if not burgers:
+        return datetime.min
+    return max(b.pkg_end for b in burgers)
+
+
+def _inventory_covers(inventory: dict, required: dict) -> bool:
+    for k, v in required.items():
+        if inventory.get(k, 0) < v:
+            return False
+    return True
+
+
+def _burger_to_dict(b: BurgerAssignment) -> dict:
+    return {
+        "item_id": b.item_id,
+        "ingredients": b.ingredients,
+        "tier": b.tier,
+        "cook_start": b.cook_start,
+        "cook_end": b.cook_end,
+        "assemble_start": b.asm_start,
+        "assemble_end": b.asm_end,
+        "package_start": b.pkg_start,
+        "package_end": b.pkg_end,
+    }
+
+
+# ----- batch wrapper (backwards-compatible) -----
+
+
+def schedule_orders(branches, orders, policy: str = "auto_accept"):
+    """Batch entry point. Drives a :class:`BranchScheduler` per branch,
+    feeding orders in arrival order.
+
+    policy:
+        - ``"auto_accept"`` (default): infeasible orders are committed at
+          tier 1 so they don't block feasible ones. Mirrors the v1
+          behaviour but with EDF burger-level dispatch.
+        - ``"reject_late"``: infeasible orders are dropped into ``skipped``
+          with ``reason="deadline_infeasible"``.
+        - ``"moore_hodgson"``: online Moore-Hodgson demotion. When a
+          newcomer would be tardy, demote the longest tier-0 order(s)
+          to tier-1 until the newcomer fits. Minimizes tardy count.
+        - ``"spt_batch"``: shortest-processing-time tie-break on arrival.
+          Orders sharing a timestamp are admitted smallest-first, which
+          shrinks flow time when bursts arrive together. Combined with
+          ``auto_accept`` semantics for late orders.
+    """
+    valid = ("auto_accept", "reject_late", "moore_hodgson", "spt_batch")
+    if policy not in valid:
+        raise ValueError("unknown policy: {}".format(policy))
+
+    branches_by_id = {b.branch_id: b for b in branches}
+    result = {}
 
     for branch_id, order_list in orders.items():
-        order_queue = queue.Queue()
-        order_queue.queue = queue.deque(order_list)
-        for branch in branches:
-            if branch.branch_id == branch_id:
-                branch_info = branch
-        schedule_branch_orders(branch_info, order_queue)
+        if branch_id not in branches_by_id:
+            raise data_reader.NoBranchInfoError(
+                "No branch info for branch_id {}".format(branch_id))
+        scheduler = BranchScheduler(branches_by_id[branch_id])
+
+        if policy == "spt_batch":
+            sorted_orders = sorted(
+                order_list,
+                key=lambda o: (o.date_time, len(o.burgers), o.order_id))
+        else:
+            sorted_orders = sorted(order_list, key=lambda o: o.date_time)
+
+        for order in sorted_orders:
+            now = datetime.strptime(order.date_time, DATE_FORMAT)
+            if policy == "moore_hodgson":
+                scheduler.admit_moore_hodgson(
+                    order, now, accept_late=True)
+            else:
+                accept_late = (policy in ("auto_accept", "spt_batch"))
+                scheduler.admit(order, now, accept_late=accept_late)
+        result[branch_id] = scheduler.snapshot()
+    return result
 
 
-def schedule_branch_orders(branch_info, order_queue):
-
-    cooking_capacity = branch_info.cooking["capacity"]
-    assembling_capacity = branch_info.assembling["capacity"]
-    packaging_capacity = branch_info.packaging["capacity"]
-
-    cooking_lead_time = branch_info.cooking["lead_time"]
-    assembling_lead_time = branch_info.assembling["lead_time"]
-    packaging_lead_time = branch_info.packaging["lead_time"]
-
-    cooking_queues = []
-    for i in range(cooking_capacity):
-        cooking_queues.append(queue.Queue())
-
-    assembling_queues = []
-    for i in range(assembling_capacity):
-        assembling_queues.append(queue.Queue())
-
-    packaging_queues = []
-    for i in range(packaging_capacity):
-        packaging_queues.append(queue.Queue())
-
-    while True:
-        order = order_queue.get()
-        # print(order.burgers, order.date_time, order.calculate_burgers_number(),
-        #       order.calculate_limit_time(), order.calculate_order_ingredients())
-        burgers_number = order.calculate_burgers_number()
-        print("burgers_number", burgers_number)
-
-        for i in range(burgers_number):
-            minimum_size = float('inf')
-            for index, cooking_queue in enumerate(cooking_queues):
-                queue_size = cooking_queue.qsize()
-                if queue_size < minimum_size:
-                    minimum_size = queue_size
-                    selected_cooking_queue_index = index
-            cooking_queues[selected_cooking_queue_index].put(order.burgers[i])
-        print(cooking_queues[0].qsize(), cooking_queues[1].qsize(), cooking_queues[2].qsize(), cooking_queues[3].qsize())
+schedule = schedule_orders
 
 
 if __name__ == "__main__":
-    txt_filepath = "../tests/Files/input.txt"
+    txt_filepath = os.path.join(
+        os.path.dirname(__file__), "..", "tests", "Files", "input.txt")
     branches, orders = data_reader.read_input_txt(txt_filepath)
-    schedule(branches=branches, orders=orders)
+    result = schedule_orders(branches=branches, orders=orders)
+    for branch_id, branch_result in result.items():
+        on_time = sum(1 for o in branch_result["orders"] if o["on_time"])
+        print("Branch {}: {} scheduled ({} on time), {} skipped".format(
+            branch_id,
+            len(branch_result["orders"]),
+            on_time,
+            len(branch_result["skipped"])))
+        for o in branch_result["orders"]:
+            tag = "OK  " if o["on_time"] else "LATE"
+            print("  [{}] {} tier={} end={} limit={}".format(
+                tag, o["order_id"], o["tier"], o["end"], o["limit"]))
+        for s in branch_result["skipped"]:
+            print("  [SKIP] {} reason={}".format(
+                s["order_id"], s.get("reason")))

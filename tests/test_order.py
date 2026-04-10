@@ -2,7 +2,7 @@ import unittest
 import logging
 
 
-import burger_joint_optimization.orders_optimisation.order as ut
+import orders_optimisation.order as ut
 
 formatter = logging.Formatter(
     '%(asctime)s : %(name)s : %(levelname)s : %(message)s'

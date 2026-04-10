@@ -2,8 +2,8 @@ import logging
 import re
 import os
 
-from burger_joint_optimization.orders_optimisation.order import Order, Item
-from burger_joint_optimization.orders_optimisation.branch import Branch
+from .order import Order, Item
+from .branch import Branch
 
 logger = logging.getLogger(__name__)
 
