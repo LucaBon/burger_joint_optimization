@@ -16,7 +16,6 @@ from .order_scheduler import (
     AdmissionVerdict,
     BranchScheduler,
     DATE_FORMAT,
-    _inventory_covers,
 )
 
 
@@ -33,7 +32,7 @@ class MultiBranchDispatcher:
 
     def admit(self, order: Order, now: datetime) -> AdmissionResult:
         try:
-            required = order.calculate_order_ingredients()
+            order.calculate_order_ingredients()
         except InvalidIngredientError:
             # Let the home branch record the rejection cleanly.
             home = self._schedulers[order.branch_id]
@@ -41,9 +40,9 @@ class MultiBranchDispatcher:
 
         candidates = []
         for bid, sch in self._schedulers.items():
-            if not _inventory_covers(sch._branch.inventory, required):
-                continue
             verdict = sch.estimate(order, now)
+            if not verdict.inventory_feasible:
+                continue
             candidates.append((bid, sch, verdict))
 
         if not candidates:

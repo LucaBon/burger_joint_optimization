@@ -9,7 +9,8 @@ class Branch:
                  cooking,
                  assembling,
                  packaging,
-                 inventory):
+                 inventory,
+                 restocks=None):
         """
 
         Args:
@@ -23,12 +24,18 @@ class Branch:
             packaging: it contains info about the packaging process.
                        It is  structured as follows {"capacity": int,
                                                      "lead_time": int}
-            inventory: it contains info about the inventory.
-                       It is structured as follows {"burgers_patties": int,
-                                                    "lettuce": int,
-                                                    "tomato": int,
-                                                    "veggie_patties": int,
-                                                    "bacon": int}
+            inventory: the **t=0 snapshot** of the branch's stock. Under the
+                       time-aware inventory model this dict is not mutated by
+                       the scheduler; live stock at a given wall-clock instant
+                       is obtained via ``BranchScheduler.current_stock(now)``.
+                       Structured as {"burgers_patties": int,
+                                      "lettuce": int,
+                                      "tomato": int,
+                                      "veggie_patties": int,
+                                      "bacon": int}
+            restocks: optional list of scheduled future inflows, each a
+                      ``(datetime, {ingredient: amount})`` tuple. Consumed by
+                      :class:`BranchScheduler` via ``InventoryTimeline``.
         """
 
         self._check_input(branch_id, cooking, assembling, packaging, inventory)
@@ -38,6 +45,7 @@ class Branch:
         self._assembling = assembling
         self._packaging = packaging
         self._inventory = inventory
+        self._restocks = list(restocks) if restocks else []
 
     @staticmethod
     def _check_input(branch_id, cooking, assembling, packaging, inventory):
@@ -92,6 +100,17 @@ class Branch:
     @property
     def inventory(self):
         return self._inventory
+
+    @property
+    def restocks(self):
+        return sorted(self._restocks, key=lambda e: e[0])
+
+    def add_restocks(self, new_restocks):
+        """Append one or more scheduled restocks.
+
+        Each element must be a ``(datetime, {ingredient: amount})`` tuple.
+        """
+        self._restocks.extend(new_restocks)
 
     def remove_ingredients_from_inventory(self, ingredients_to_remove):
         for (k_inventory, v_inventory), (k_ingredients, v_ingredients) in zip(

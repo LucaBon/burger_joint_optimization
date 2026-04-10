@@ -1,11 +1,17 @@
 import logging
 import re
 import os
+from datetime import datetime
 
 from .order import Order, Item
 from .branch import Branch
 
 logger = logging.getLogger(__name__)
+
+_VALID_INGREDIENT_KEYS = {"burgers_patties", "lettuce", "tomato",
+                          "veggie_patties", "bacon"}
+
+_RESTOCK_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def is_branch_info_line(line):
@@ -46,6 +52,44 @@ def is_order_info_line(line):
         return True
     else:
         return False
+
+
+def is_restock_info_line(line):
+    """
+
+    Args:
+        line (str): a line extracted from the input file
+
+    Returns:
+        bool: whether or not the line contains a valid RESTOCK directive
+    """
+    restock_format = re.compile(
+        "^R[0-9]+,RESTOCK,[0-9]{4}-[0-1][0-9]-[0-3][0-9] "
+        "[0-2][0-9]:[0-5][0-9]:[0-5][0-9]"
+        "(,[a-z_]+:[0-9]+)+$")
+    match = re.match(restock_format, line)
+    return match is not None
+
+
+def read_restock_info(restock_line):
+    """Parse a RESTOCK line into ``(branch_id, datetime, {ingredient: amount})``.
+
+    Raises :class:`UnknownIngredientError` when a key is not one of the
+    five known ingredients.
+    """
+    parts = restock_line.rstrip("\n").split(",")
+    branch_id = parts[0]
+    # parts[1] is "RESTOCK"
+    ts = datetime.strptime(parts[2], _RESTOCK_DATE_FORMAT)
+    deltas = {}
+    for tok in parts[3:]:
+        key, amount = tok.split(":")
+        if key not in _VALID_INGREDIENT_KEYS:
+            raise UnknownIngredientError(
+                "Unknown ingredient '{}' in restock line for branch"
+                " {}".format(key, branch_id))
+        deltas[key] = int(amount)
+    return branch_id, ts, deltas
 
 
 def read_branch_info(branch_info_line):
@@ -140,7 +184,9 @@ def read_input_txt(path_to_txt_file):
     _check_read_input_txt(path_to_txt_file)
 
     branches_list = []
+    branches_by_id = {}
     orders_dict = {}
+    pending_restocks = {}
 
     with open(path_to_txt_file, "r") as f:
         while True:
@@ -152,10 +198,13 @@ def read_input_txt(path_to_txt_file):
 
             if is_branch_info_line(line):
                 branch = read_branch_info(line)
-                branches_id_list = [branch_obj.branch_id for branch_obj in branches_list]
-                if branch.branch_id not in branches_id_list:
+                if branch.branch_id not in branches_by_id:
                     branches_list.append(branch)
+                    branches_by_id[branch.branch_id] = branch
                     orders_dict[branch.branch_id] = []
+                    buffered = pending_restocks.pop(branch.branch_id, [])
+                    if buffered:
+                        branch.add_restocks(buffered)
                 else:
                     raise DuplicatedBranchIdError("The branch id {} already"
                                                   " exists".format(branch.branch_id))
@@ -170,6 +219,20 @@ def read_input_txt(path_to_txt_file):
                                             "for which no info are present"
                                             "".format(order.order_id,
                                                       order.branch_id))
+
+            if is_restock_info_line(line):
+                branch_id, ts, deltas = read_restock_info(line)
+                if branch_id in branches_by_id:
+                    branches_by_id[branch_id].add_restocks([(ts, deltas)])
+                else:
+                    pending_restocks.setdefault(branch_id, []).append(
+                        (ts, deltas))
+
+    if pending_restocks:
+        orphan = next(iter(pending_restocks))
+        raise NoBranchInfoError(
+            "A restock line refers to branch {} for which no info are"
+            " present".format(orphan))
 
     return branches_list, orders_dict
 
@@ -191,4 +254,8 @@ class DuplicatedBranchIdError(ValueError):
 
 
 class NoBranchInfoError(ValueError):
+    pass
+
+
+class UnknownIngredientError(ValueError):
     pass

@@ -6,6 +6,35 @@ from datetime import timedelta
 logger = logging.getLogger(__name__)
 
 
+_INGREDIENT_KEYS = ("burgers_patties", "lettuce", "tomato",
+                    "veggie_patties", "bacon")
+
+
+def burger_ingredients(code):
+    """Return the five-key ingredient dict for a single burger ``code``.
+
+    Uses the same "V implies veggie else beef" rule as ``Order``.
+    Raises :class:`InvalidIngredientError` on unknown single-letter codes.
+    """
+    out = {k: 0 for k in _INGREDIENT_KEYS}
+    if "V" not in code:
+        out["burgers_patties"] += 1
+    for ch in code:
+        if ch == "L":
+            out["lettuce"] += 1
+        elif ch == "T":
+            out["tomato"] += 1
+        elif ch == "B":
+            out["bacon"] += 1
+        elif ch == "V":
+            out["veggie_patties"] += 1
+        else:
+            raise InvalidIngredientError(
+                "The order contains the following invalid ingredient"
+                ": {}".format(ch))
+    return out
+
+
 class Order:
 
     # each order should be processed within 20 minutes
@@ -65,23 +94,8 @@ class Order:
                              "veggie_patties": 0,
                              "bacon": 0}
         for burger in self.burgers:
-            if "V" not in burger.ingredients:
-                order_ingredients["burgers_patties"] += 1
-
-            for ingredient in burger.ingredients:
-                if ingredient == "L":
-                    order_ingredients["lettuce"] += 1
-                if ingredient == "T":
-                    order_ingredients["tomato"] += 1
-                if ingredient == "B":
-                    order_ingredients["bacon"] += 1
-                if ingredient == "V":
-                    order_ingredients["veggie_patties"] += 1
-                elif ingredient not in ["L", "T", "B", "V"]:
-                    raise InvalidIngredientError("The order contains the "
-                                                 "following invalid ingredient"
-                                                 ": {}"
-                                                 "".format(ingredient))
+            for k, v in burger_ingredients(burger.ingredients).items():
+                order_ingredients[k] += v
         return order_ingredients
 
     def are_ingredients_in_inventory(self):

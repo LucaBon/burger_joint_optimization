@@ -2,10 +2,11 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from .order import InvalidIngredientError, Order
+from .order import InvalidIngredientError, Order, burger_ingredients
 from .branch import Branch, ExhaustedIngredientError
+from .inventory_timeline import InventoryTimeline
 from . import data_reader
 
 
@@ -49,6 +50,8 @@ class AdmissionVerdict:
     projected_end: datetime
     lateness: timedelta
     displaced_orders: List[str] = field(default_factory=list)
+    inventory_feasible: bool = True
+    deadline_feasible: bool = True
 
 
 @dataclass
@@ -57,6 +60,13 @@ class AdmissionResult:
     verdict: AdmissionVerdict
     schedule: List[BurgerAssignment] = field(default_factory=list)
     reason: Optional[str] = None
+
+
+@dataclass
+class CancelResult:
+    order_id: str
+    refunded: Dict[str, int]
+    status: str = "cancelled"
 
 
 class BranchScheduler:
@@ -88,6 +98,9 @@ class BranchScheduler:
         self._asm_cap = branch.assembling["capacity"]
         self._pkg_cap = branch.packaging["capacity"]
 
+        self._timeline = InventoryTimeline(
+            initial=branch.inventory, restocks=branch.restocks)
+
     # ----- public API -----
 
     def estimate(self, order: Order, now: datetime) -> AdmissionVerdict:
@@ -99,7 +112,7 @@ class BranchScheduler:
         new_end = _projected_end(projected, order.order_id)
         deadline = now + timedelta(
             minutes=order.max_order_completion_time)
-        feasible = new_end <= deadline
+        deadline_feasible = new_end <= deadline
         lateness = new_end - deadline if new_end > deadline else timedelta(0)
 
         displaced: List[str] = []
@@ -111,11 +124,17 @@ class BranchScheduler:
             if base_end <= meta.deadline < new_end_other:
                 displaced.append(oid)
 
+        projected_consumptions = _consumptions_from_plan(projected)
+        inventory_feasible = self._timeline.feasible_with(
+            projected_consumptions)
+
         return AdmissionVerdict(
-            feasible=feasible,
+            feasible=deadline_feasible and inventory_feasible,
             projected_end=new_end,
             lateness=lateness,
             displaced_orders=displaced,
+            inventory_feasible=inventory_feasible,
+            deadline_feasible=deadline_feasible,
         )
 
     def admit_moore_hodgson(self, order: Order, now: datetime,
@@ -139,17 +158,14 @@ class BranchScheduler:
                 "order {} already admitted".format(order.order_id))
 
         try:
-            required = order.calculate_order_ingredients()
+            order.calculate_order_ingredients()
         except InvalidIngredientError as exc:
             return self._record_rejection(
                 order, "invalid_ingredient: {}".format(exc))
 
-        if not _inventory_covers(self._branch.inventory, required):
-            return self._record_rejection(order, "inventory_exhausted")
-
         verdict = self.estimate(order, now)
         if verdict.feasible and not verdict.displaced_orders:
-            return self._commit(order, now, required,
+            return self._commit(order, now,
                                 TIER_ON_TIME, "accepted", verdict)
 
         # Track original (tier, status) so we can roll back on failure.
@@ -184,7 +200,7 @@ class BranchScheduler:
             new_verdict = self.estimate(order, now)
 
         if new_verdict.feasible and not new_verdict.displaced_orders:
-            return self._commit(order, now, required,
+            return self._commit(order, now,
                                 TIER_ON_TIME, "accepted_mh", new_verdict)
 
         # Roll back demotions and fall through to the classic path.
@@ -193,11 +209,14 @@ class BranchScheduler:
             meta.tier = tier
             meta.status = status
 
+        if not verdict.inventory_feasible:
+            return self._record_rejection(order, "inventory_exhausted")
+
         if accept_late:
-            return self._commit(order, now, required,
+            return self._commit(order, now,
                                 TIER_LATE, "accepted_late", verdict)
 
-        reason = ("deadline_infeasible" if not verdict.feasible
+        reason = ("deadline_infeasible" if not verdict.deadline_feasible
                   else "would_displace")
         self._rejected.append({
             "order_id": order.order_id,
@@ -208,11 +227,18 @@ class BranchScheduler:
         return AdmissionResult(
             status="rejected", verdict=verdict, reason=reason)
 
-    def _commit(self, order: Order, now: datetime, required: dict,
+    def _commit(self, order: Order, now: datetime,
                 tier: int, status: str,
                 verdict: AdmissionVerdict) -> AdmissionResult:
-        """Shared commit path for :meth:`admit` and :meth:`admit_moore_hodgson`."""
-        self._branch.remove_ingredients_from_inventory(required)
+        """Shared commit path for :meth:`admit` and :meth:`admit_moore_hodgson`.
+
+        Transactional against the inventory timeline: if re-optimizing the
+        plan with the newcomer pushes any consumption event such that the
+        running stock would go negative, the commit is rolled back and the
+        newcomer rejected with ``inventory_exhausted``.
+        """
+        snap = self._timeline.snapshot()
+        previous_assignments = self._assignments
         self._order_meta[order.order_id] = _OrderMeta(
             order=order,
             arrival=now,
@@ -221,8 +247,22 @@ class BranchScheduler:
             tier=tier,
             status=status,
         )
-        self._assignments = self._simulate(
+        new_plan = self._simulate(
             now=now, new_order=order, new_tier=tier)
+
+        for oid in new_plan:
+            per_order = _consumptions_from_plan(new_plan, oid)
+            self._timeline.replace_order(oid, per_order)
+
+        if not self._timeline.feasible_with({}):
+            # Re-optimization shifted a predecessor's cook_start past a
+            # restock such that running stock goes negative. Roll back.
+            self._timeline.restore(snap)
+            self._order_meta.pop(order.order_id)
+            self._assignments = previous_assignments
+            return self._record_rejection(order, "inventory_exhausted")
+
+        self._assignments = new_plan
         return AdmissionResult(
             status=status if status != "accepted_mh" else "accepted",
             verdict=verdict,
@@ -234,22 +274,25 @@ class BranchScheduler:
         """Attempt to admit ``order``.
 
         ``accept_late=True`` forces acceptance even when the estimate is
-        infeasible or would displace existing tier-0 orders; infeasible
-        orders are committed at tier 1 so they cannot starve tier-0 work.
+        deadline-infeasible or would displace existing tier-0 orders;
+        infeasible orders are committed at tier 1 so they cannot starve
+        tier-0 work. Inventory infeasibility is always a hard stop, even
+        with ``accept_late=True``.
         """
         if order.order_id in self._order_meta:
             raise ValueError(
                 "order {} already admitted".format(order.order_id))
 
         try:
-            required = order.calculate_order_ingredients()
+            order.calculate_order_ingredients()
         except InvalidIngredientError as exc:
-            return self._record_rejection(order, "invalid_ingredient: {}".format(exc))
-
-        if not _inventory_covers(self._branch.inventory, required):
-            return self._record_rejection(order, "inventory_exhausted")
+            return self._record_rejection(
+                order, "invalid_ingredient: {}".format(exc))
 
         verdict = self.estimate(order, now)
+
+        if not verdict.inventory_feasible:
+            return self._record_rejection(order, "inventory_exhausted")
 
         if verdict.feasible and not verdict.displaced_orders:
             tier, status = TIER_ON_TIME, "accepted"
@@ -259,7 +302,9 @@ class BranchScheduler:
             else:
                 tier, status = TIER_LATE, "accepted_late"
         else:
-            reason = "deadline_infeasible" if not verdict.feasible else "would_displace"
+            reason = ("deadline_infeasible"
+                      if not verdict.deadline_feasible
+                      else "would_displace")
             self._rejected.append({
                 "order_id": order.order_id,
                 "reason": reason,
@@ -269,23 +314,38 @@ class BranchScheduler:
             return AdmissionResult(
                 status="rejected", verdict=verdict, reason=reason)
 
-        self._branch.remove_ingredients_from_inventory(required)
-        self._order_meta[order.order_id] = _OrderMeta(
-            order=order,
-            arrival=now,
-            deadline=now + timedelta(
-                minutes=order.max_order_completion_time),
-            tier=tier,
-            status=status,
-        )
-        self._assignments = self._simulate(
-            now=now, new_order=order, new_tier=tier)
+        return self._commit(order, now, tier, status, verdict)
 
-        return AdmissionResult(
-            status=status,
-            verdict=verdict,
-            schedule=list(self._assignments[order.order_id]),
-        )
+    def cancel(self, order_id: str, now: datetime) -> CancelResult:
+        """Cancel an accepted order and refund its unstarted burgers.
+
+        Burgers whose recorded ``cook_start >= now`` have their
+        ingredients returned to the timeline (the burger has not yet
+        physically consumed anything at ``now``). Burgers whose cook
+        started strictly before ``now`` are sunk cost — their consumption
+        events remain in the timeline even after the order is forgotten.
+        After cancellation, all surviving orders are re-simulated and
+        their consumption events re-pinned to the new cook_starts.
+        """
+        if order_id not in self._order_meta:
+            raise KeyError(
+                "order {} is not admitted".format(order_id))
+
+        refunded = self._timeline.refund(order_id, min_cook_start=now)
+        self._order_meta.pop(order_id)
+        self._assignments.pop(order_id, None)
+
+        new_plan = self._simulate(now=now)
+        for oid in self._order_meta:
+            per_order = _consumptions_from_plan(new_plan, oid)
+            self._timeline.replace_order(oid, per_order)
+        self._assignments = new_plan
+
+        return CancelResult(order_id=order_id, refunded=refunded)
+
+    def current_stock(self, now: datetime) -> Dict[str, int]:
+        """Return the projected available stock at wall-clock ``now``."""
+        return self._timeline.current_stock(now)
 
     def snapshot(self) -> dict:
         """Return a batch-shaped view compatible with the legacy API."""
@@ -476,11 +536,24 @@ def _projected_end(plan: Dict[str, List[BurgerAssignment]],
     return max(b.pkg_end for b in burgers)
 
 
-def _inventory_covers(inventory: dict, required: dict) -> bool:
-    for k, v in required.items():
-        if inventory.get(k, 0) < v:
-            return False
-    return True
+def _consumptions_from_plan(
+    plan: Dict[str, List[BurgerAssignment]],
+    order_id: Optional[str] = None,
+) -> Dict[Tuple[str, int], Tuple[datetime, Dict[str, int]]]:
+    """Extract per-burger consumption events from a simulated plan.
+
+    Returns ``{(order_id, item_id): (cook_start, per_burger_ingredients)}``.
+    If ``order_id`` is given, restrict the output to burgers belonging to
+    that order.
+    """
+    out: Dict[Tuple[str, int], Tuple[datetime, Dict[str, int]]] = {}
+    for oid, burgers in plan.items():
+        if order_id is not None and oid != order_id:
+            continue
+        for b in burgers:
+            out[(oid, b.item_id)] = (
+                b.cook_start, burger_ingredients(b.ingredients))
+    return out
 
 
 def _burger_to_dict(b: BurgerAssignment) -> dict:
