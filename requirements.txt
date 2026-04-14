@@ -1,0 +1,4 @@
+# The scheduler uses only Python 3.8+ stdlib — there are no runtime
+# dependencies. This file is intentionally empty so tools that look for
+# it (pip, dependency scanners, reproducibility checks) find a canonical
+# answer: "nothing to install."

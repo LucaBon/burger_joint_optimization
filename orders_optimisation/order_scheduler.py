@@ -1,3 +1,4 @@
+import heapq
 import logging
 import os
 from dataclasses import dataclass, field
@@ -5,7 +6,8 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from .order import InvalidIngredientError, Order, burger_ingredients
-from .branch import Branch, ExhaustedIngredientError
+from .branch import Branch
+from .dispatch_policies import DispatchPolicy, get_policy
 from .inventory_timeline import InventoryTimeline
 from . import data_reader
 
@@ -85,11 +87,16 @@ class BranchScheduler:
     read-only :meth:`estimate` never mutates state.
     """
 
-    def __init__(self, branch: Branch):
+    def __init__(self, branch: Branch,
+                 dispatch_policy: Optional[object] = None):
         self._branch = branch
         self._order_meta: Dict[str, _OrderMeta] = {}
         self._assignments: Dict[str, List[BurgerAssignment]] = {}
         self._rejected: List[dict] = []
+        # Deadline-infeasible orders parked for later re-evaluation.
+        # Populated only when callers pass ``backorder=True`` to admit.
+        self._backorder_queue: List[Order] = []
+        self._dispatch_policy: DispatchPolicy = get_policy(dispatch_policy)
 
         self._cook_lead = timedelta(minutes=branch.cooking["lead_time"])
         self._asm_lead = timedelta(minutes=branch.assembling["lead_time"])
@@ -97,6 +104,19 @@ class BranchScheduler:
         self._cook_cap = branch.cooking["capacity"]
         self._asm_cap = branch.assembling["capacity"]
         self._pkg_cap = branch.packaging["capacity"]
+
+        # Extra-worker shift starts, flattened to (start_datetime, idx)
+        # tuples. Each extra shift worker is a distinct heap slot whose
+        # free_at begins at the shift start; once a shift starts, that
+        # worker stays in the pool for the rest of the run.
+        self._cook_shift_starts = _flatten_shift_starts(
+            branch.shifts_for("cooking"), self._cook_cap)
+        self._asm_shift_starts = _flatten_shift_starts(
+            branch.shifts_for("assembling"),
+            self._cook_cap + len(self._cook_shift_starts))
+        self._pkg_shift_starts = _flatten_shift_starts(
+            branch.shifts_for("packaging"),
+            self._asm_cap + len(self._asm_shift_starts))
 
         self._timeline = InventoryTimeline(
             initial=branch.inventory, restocks=branch.restocks)
@@ -270,7 +290,8 @@ class BranchScheduler:
         )
 
     def admit(self, order: Order, now: datetime,
-              accept_late: bool = False) -> AdmissionResult:
+              accept_late: bool = False,
+              backorder: bool = False) -> AdmissionResult:
         """Attempt to admit ``order``.
 
         ``accept_late=True`` forces acceptance even when the estimate is
@@ -278,6 +299,16 @@ class BranchScheduler:
         infeasible orders are committed at tier 1 so they cannot starve
         tier-0 work. Inventory infeasibility is always a hard stop, even
         with ``accept_late=True``.
+
+        ``backorder=True`` parks a deadline-infeasible order into an
+        internal queue instead of rejecting it. Queued orders are
+        retried automatically after every successful commit and every
+        cancellation — at which point they may become feasible thanks
+        to freed capacity. Inventory-infeasible orders are never
+        queued (no point waiting for stock that is not scheduled to
+        appear). ``backorder`` is orthogonal to ``accept_late`` and
+        wins over it: when both are set, the order is queued rather
+        than committed at tier 1.
         """
         if order.order_id in self._order_meta:
             raise ValueError(
@@ -296,6 +327,12 @@ class BranchScheduler:
 
         if verdict.feasible and not verdict.displaced_orders:
             tier, status = TIER_ON_TIME, "accepted"
+        elif backorder:
+            self._backorder_queue.append(order)
+            return AdmissionResult(
+                status="backordered",
+                verdict=verdict,
+                reason="deadline_infeasible")
         elif accept_late:
             if verdict.feasible:
                 tier, status = TIER_ON_TIME, "accepted"
@@ -314,7 +351,24 @@ class BranchScheduler:
             return AdmissionResult(
                 status="rejected", verdict=verdict, reason=reason)
 
-        return self._commit(order, now, tier, status, verdict)
+        result = self._commit(order, now, tier, status, verdict)
+        self._drain_backorder_queue(now)
+        return result
+
+    def _drain_backorder_queue(self, now: datetime) -> None:
+        """Retry every queued backorder once. Successful admissions
+        leave the queue and flow through the normal accepted path;
+        everything else stays parked for a future drain call."""
+        if not self._backorder_queue:
+            return
+        pending = self._backorder_queue
+        self._backorder_queue = []
+        for order in pending:
+            verdict = self.estimate(order, now)
+            if verdict.feasible and not verdict.displaced_orders:
+                self._commit(order, now, TIER_ON_TIME, "accepted", verdict)
+            else:
+                self._backorder_queue.append(order)
 
     def cancel(self, order_id: str, now: datetime) -> CancelResult:
         """Cancel an accepted order and refund its unstarted burgers.
@@ -341,11 +395,17 @@ class BranchScheduler:
             self._timeline.replace_order(oid, per_order)
         self._assignments = new_plan
 
+        self._drain_backorder_queue(now)
         return CancelResult(order_id=order_id, refunded=refunded)
 
     def current_stock(self, now: datetime) -> Dict[str, int]:
         """Return the projected available stock at wall-clock ``now``."""
         return self._timeline.current_stock(now)
+
+    @property
+    def backorder_queue(self) -> List[Order]:
+        """Read-only view of orders parked pending retry."""
+        return list(self._backorder_queue)
 
     def snapshot(self) -> dict:
         """Return a batch-shaped view compatible with the legacy API."""
@@ -367,7 +427,12 @@ class BranchScheduler:
                 "status": meta.status,
                 "burgers": [_burger_to_dict(b) for b in burgers],
             })
-        return {"orders": orders_out, "skipped": list(self._rejected)}
+        return {
+            "orders": orders_out,
+            "skipped": list(self._rejected),
+            "backordered_pending": [o.order_id
+                                    for o in self._backorder_queue],
+        }
 
     # ----- internals -----
 
@@ -401,9 +466,13 @@ class BranchScheduler:
 
         for oid, burgers in self._assignments.items():
             meta = self._order_meta[oid]
+            order_size = len(meta.order.burgers)
+            priority = getattr(meta.order, "priority", 0)
             for ba in burgers:
                 states.append({
                     "tier": meta.tier,
+                    "priority": priority,
+                    "order_size": order_size,
                     "deadline": meta.deadline,
                     "arrival": meta.arrival,
                     "oid": oid,
@@ -426,9 +495,13 @@ class BranchScheduler:
         if new_order is not None:
             new_deadline = now + timedelta(
                 minutes=new_order.max_order_completion_time)
+            new_priority = getattr(new_order, "priority", 0)
+            new_order_size = len(new_order.burgers)
             for item in new_order.burgers:
                 states.append({
                     "tier": new_tier,
+                    "priority": new_priority,
+                    "order_size": new_order_size,
                     "deadline": new_deadline,
                     "arrival": now,
                     "oid": new_order.order_id,
@@ -448,9 +521,16 @@ class BranchScheduler:
                     "pkg_end": None,
                 })
 
-        cook_free = [now] * self._cook_cap
-        asm_free = [now] * self._asm_cap
-        pkg_free = [now] * self._pkg_cap
+        # Track per-worker "earliest free" wall-clock times so we can honour
+        # frozen burgers before the heap is built. Base workers are free
+        # from ``now``; extra shift workers are free from their shift
+        # start (or ``now`` if the shift has already begun).
+        cook_free = [now] * self._cook_cap + [
+            max(now, s) for s in self._cook_shift_starts]
+        asm_free = [now] * self._asm_cap + [
+            max(now, s) for s in self._asm_shift_starts]
+        pkg_free = [now] * self._pkg_cap + [
+            max(now, s) for s in self._pkg_shift_starts]
 
         for s in states:
             if s["cook_frozen"] and s["cook_end"] > cook_free[s["cook_worker"]]:
@@ -460,36 +540,44 @@ class BranchScheduler:
             if s["pkg_frozen"] and s["pkg_end"] > pkg_free[s["pkg_worker"]]:
                 pkg_free[s["pkg_worker"]] = s["pkg_end"]
 
-        states.sort(key=lambda s: (
-            s["tier"], s["deadline"], s["arrival"], s["oid"], s["item_id"]))
+        # Min-heap of (free_at, worker_idx) per stage: O(log w) per pick
+        # vs O(w) scan in the previous linear implementation.
+        cook_heap = [(t, i) for i, t in enumerate(cook_free)]
+        asm_heap = [(t, i) for i, t in enumerate(asm_free)]
+        pkg_heap = [(t, i) for i, t in enumerate(pkg_free)]
+        heapq.heapify(cook_heap)
+        heapq.heapify(asm_heap)
+        heapq.heapify(pkg_heap)
+
+        states.sort(key=self._dispatch_policy.sort_key)
 
         for s in states:
             if not s["cook_frozen"]:
-                ci = _earliest_idx(cook_free)
+                free_at, ci = heapq.heappop(cook_heap)
                 not_before = s["arrival"]
-                cs = cook_free[ci] if cook_free[ci] > not_before else not_before
+                cs = free_at if free_at > not_before else not_before
                 ce = cs + self._cook_lead
-                cook_free[ci] = ce
+                heapq.heappush(cook_heap, (ce, ci))
                 s["cook_worker"] = ci
                 s["cook_start"] = cs
                 s["cook_end"] = ce
 
             if not s["asm_frozen"]:
-                ai = _earliest_idx(asm_free)
+                free_at, ai = heapq.heappop(asm_heap)
                 cook_end = s["cook_end"]
-                as_ = asm_free[ai] if asm_free[ai] > cook_end else cook_end
+                as_ = free_at if free_at > cook_end else cook_end
                 ae = as_ + self._asm_lead
-                asm_free[ai] = ae
+                heapq.heappush(asm_heap, (ae, ai))
                 s["asm_worker"] = ai
                 s["asm_start"] = as_
                 s["asm_end"] = ae
 
             if not s["pkg_frozen"]:
-                pi = _earliest_idx(pkg_free)
+                free_at, pi = heapq.heappop(pkg_heap)
                 asm_end = s["asm_end"]
-                ps = pkg_free[pi] if pkg_free[pi] > asm_end else asm_end
+                ps = free_at if free_at > asm_end else asm_end
                 pe = ps + self._pkg_lead
-                pkg_free[pi] = pe
+                heapq.heappush(pkg_heap, (pe, pi))
                 s["pkg_worker"] = pi
                 s["pkg_start"] = ps
                 s["pkg_end"] = pe
@@ -520,12 +608,18 @@ class BranchScheduler:
 # ----- helpers -----
 
 
-def _earliest_idx(workers: List[datetime]) -> int:
-    best = 0
-    for i in range(1, len(workers)):
-        if workers[i] < workers[best]:
-            best = i
-    return best
+def _flatten_shift_starts(shifts, _base_offset: int) -> List[datetime]:
+    """Return one start-time per extra worker defined by ``shifts``.
+
+    Each shift entry ``(start, end, extra_cap)`` contributes
+    ``extra_cap`` entries — one per additional worker. The ``end`` field
+    is ignored in this iteration (see Branch.shifts docstring).
+    """
+    out: List[datetime] = []
+    for start, _end, extra in shifts:
+        for _ in range(extra):
+            out.append(start)
+    return out
 
 
 def _projected_end(plan: Dict[str, List[BurgerAssignment]],
@@ -573,7 +667,8 @@ def _burger_to_dict(b: BurgerAssignment) -> dict:
 # ----- batch wrapper (backwards-compatible) -----
 
 
-def schedule_orders(branches, orders, policy: str = "auto_accept"):
+def schedule_orders(branches, orders, policy: str = "auto_accept",
+                    dispatch_policy: Optional[object] = None):
     """Batch entry point. Drives a :class:`BranchScheduler` per branch,
     feeding orders in arrival order.
 
@@ -591,7 +686,8 @@ def schedule_orders(branches, orders, policy: str = "auto_accept"):
           shrinks flow time when bursts arrive together. Combined with
           ``auto_accept`` semantics for late orders.
     """
-    valid = ("auto_accept", "reject_late", "moore_hodgson", "spt_batch")
+    valid = ("auto_accept", "reject_late", "moore_hodgson",
+             "spt_batch", "backorder")
     if policy not in valid:
         raise ValueError("unknown policy: {}".format(policy))
 
@@ -602,7 +698,9 @@ def schedule_orders(branches, orders, policy: str = "auto_accept"):
         if branch_id not in branches_by_id:
             raise data_reader.NoBranchInfoError(
                 "No branch info for branch_id {}".format(branch_id))
-        scheduler = BranchScheduler(branches_by_id[branch_id])
+        scheduler = BranchScheduler(
+            branches_by_id[branch_id],
+            dispatch_policy=dispatch_policy)
 
         if policy == "spt_batch":
             sorted_orders = sorted(
@@ -612,13 +710,26 @@ def schedule_orders(branches, orders, policy: str = "auto_accept"):
             sorted_orders = sorted(order_list, key=lambda o: o.date_time)
 
         for order in sorted_orders:
-            now = datetime.strptime(order.date_time, DATE_FORMAT)
+            now = order.date_time
             if policy == "moore_hodgson":
                 scheduler.admit_moore_hodgson(
                     order, now, accept_late=True)
+            elif policy == "backorder":
+                scheduler.admit(order, now, backorder=True)
             else:
                 accept_late = (policy in ("auto_accept", "spt_batch"))
                 scheduler.admit(order, now, accept_late=accept_late)
+
+        # Orders still parked in the backorder queue at end-of-run
+        # never found a feasible slot; surface them as skipped.
+        if policy == "backorder":
+            end_snap = scheduler.snapshot()
+            for oid in end_snap["backordered_pending"]:
+                scheduler._rejected.append({
+                    "order_id": oid,
+                    "reason": "backorder_stale",
+                })
+
         result[branch_id] = scheduler.snapshot()
     return result
 

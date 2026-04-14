@@ -15,7 +15,6 @@ from .order_scheduler import (
     AdmissionResult,
     AdmissionVerdict,
     BranchScheduler,
-    DATE_FORMAT,
 )
 
 
@@ -89,7 +88,7 @@ def schedule_orders_load_balanced(branches: List[Branch],
     all_orders.sort(key=lambda o: o.date_time)
 
     for order in all_orders:
-        now = datetime.strptime(order.date_time, DATE_FORMAT)
+        now = order.date_time
         dispatcher.admit(order, now)
 
     return dispatcher.snapshot()

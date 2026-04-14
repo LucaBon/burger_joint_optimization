@@ -135,6 +135,70 @@ a restock such that stock would go negative, the commit is rolled back.
   Orders sharing a timestamp are admitted smallest-first, which shrinks mean
   flow time when bursts arrive together. Combined with `auto_accept`
   semantics for late orders.
+- **`backorder`** — infeasible orders are parked in a retry queue instead of
+  rejected. Every successful commit and every cancellation drains the queue,
+  so capacity freed later in the run can rescue an earlier infeasible order.
+  Orders still queued at end-of-run land in `skipped` with
+  `reason="backorder_stale"`.
+
+### Pluggable dispatch policies
+
+The sort key fed to `_simulate` is extracted into
+[orders_optimisation/dispatch_policies.py](orders_optimisation/dispatch_policies.py).
+Pass `dispatch_policy=` to `BranchScheduler` or `schedule_orders` to swap the
+strategy:
+
+- `"edf"` *(default)* — Earliest Deadline First, the legacy behaviour.
+- `"spt"` — Shortest Processing Time at order granularity.
+- `"wspt"` — Weighted SPT (`priority / order_size`), classical Smith's rule.
+
+All dispatch policies honour `Order.priority` (higher = more important), so
+VIP handling composes with every strategy.
+
+### Priority / VIP orders
+
+`Order` accepts an optional `priority: int` field and the input file format
+grows an optional trailing `,P=<n>` token:
+
+```
+R1,2026-01-01 10:00:00,O1,BLT,BLT,BLT
+R1,2026-01-01 10:00:00,O2,BLT,P=5
+```
+
+Higher-priority orders queue ahead of regular work within the same tier.
+
+### Worker shifts / time-varying capacity
+
+`Branch` accepts an optional `shifts` map:
+
+```python
+branch = Branch(
+    branch_id="R1",
+    cooking={"capacity": 2, "lead_time": 1},
+    assembling={"capacity": 2, "lead_time": 1},
+    packaging={"capacity": 1, "lead_time": 1},
+    inventory={...},
+    shifts={
+        "cooking": [(start, end, 3)],    # +3 cook workers from start
+        "assembling": [(start, end, 2)],
+        "packaging": [(start, end, 1)],
+    },
+)
+```
+
+Each shift entry adds `extra_cap` workers whose availability begins at
+`start`. In this iteration the scheduler does **not** evict workers at
+`end` — once a shift-worker comes on, they stay in the pool for the rest
+of the run. This captures the common "peak-hour reinforcements" pattern
+while keeping the core scheduler semantics simple.
+
+### Cost / SLA model
+
+`orders_optimisation/cost_model.py` defines `CostModel(margin_per_order,
+lateness_penalty_per_second, rejection_cost, per_burger_margin)`. Pass it
+to `metrics.compute_metrics(result, cost_model=cm)` and the returned dict
+gains `total_revenue`, `total_lateness_penalty`, `total_rejection_cost`,
+and `net_value` — the economic score for the schedule.
 
 ### Time-aware inventory and cancellations
 
@@ -159,3 +223,16 @@ instant.
 On `tests/Files/input.txt`, the online tiered-EDF policy schedules **9/12
 orders on time** versus 5/12 for the original FCFS baseline, with no change
 to branch capacity or lead times.
+
+See [REPORT.md](REPORT.md) for the full benchmark comparison across every
+policy, the multi-branch load-balanced results, and the scale-profile
+appendix that drives the
+[tests/test_performance.py](tests/test_performance.py) regression guard.
+
+## Common commands
+
+| Task | Command |
+| --- | --- |
+| Run unit tests | `make test` (or `PYTHONPATH=. python3 -m unittest discover -s tests -t .`) |
+| Run the single-branch sample | `make run` |
+| Reproduce the benchmark tables | `make benchmark` |

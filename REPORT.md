@@ -187,9 +187,38 @@ This is where the strategies actually separate.
 ## 9. Verification
 
 ```bash
-# Existing regression suite — 25 tests, all green.
+# Regression suite.
 PYTHONPATH=. python3 -m unittest discover -s tests -t .
 
 # Reproduce the tables in §4.
 PYTHONPATH=. python3 -m orders_optimisation.benchmark
 ```
+
+## 10. Appendix — Scale profile
+
+The single-branch benchmark fixtures are 12 orders. To guard against
+O(n²)-style regressions as the stream grows, a synthetic 1000-order
+fixture ([tests/fixtures/gen_synthetic.py](tests/fixtures/gen_synthetic.py))
+drives a fat-capacity branch (20/15/10 workers, 10k stock per ingredient)
+at a steady 30-second arrival cadence.
+
+Observed wall-clock on a mid-range dev laptop:
+
+| Optimization step | 500-order cProfile cumtime | 1000-order wall-clock |
+| --- | --- | --- |
+| Pre-refactor (linear `_earliest_idx`, deepcopy snapshot, O(n) `replace_order` filter) | 26.6 s | 87.9 s |
+| Heap-based worker picking | ~23 s | ~70 s |
+| Shallow snapshot + per-order consumption map | **8.3 s** | **20.3 s** |
+
+Top hot spots after the refactor (500-order run, cumulative time):
+
+1. `BranchScheduler._simulate` — the re-simulation itself, called 3× per
+   admission (baseline estimate + with-new estimate + commit).
+2. `_consumptions_from_plan` — per-burger ingredient extraction.
+3. `InventoryTimeline._running_sum_nonnegative` — event sort + walk.
+
+Further gains would come from incremental (rather than full-from-scratch)
+re-simulation or from caching `burger_ingredients` by ingredient code;
+both were deemed out of scope for this iteration. The
+[tests/test_performance.py](tests/test_performance.py) regression test
+runs the 1000-order fixture and asserts a 30-second wall-clock budget.

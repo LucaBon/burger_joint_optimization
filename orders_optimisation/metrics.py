@@ -5,7 +5,9 @@ and returns a flat dict of aggregated KPIs. Metrics are intentionally
 scheduler-agnostic so any policy can be scored with the same yardstick.
 """
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from .cost_model import CostModel
 
 
 def _flatten_orders(result: Dict[str, dict]) -> List[dict]:
@@ -28,8 +30,14 @@ def _flatten_skipped(result: Dict[str, dict]) -> List[dict]:
     return out
 
 
-def compute_metrics(result: Dict[str, dict]) -> dict:
-    """Compute global KPIs across all branches in a schedule result."""
+def compute_metrics(result: Dict[str, dict],
+                    cost_model: Optional[CostModel] = None) -> dict:
+    """Compute global KPIs across all branches in a schedule result.
+
+    When ``cost_model`` is provided, the returned dict also contains
+    ``total_revenue``, ``total_lateness_penalty``, ``total_rejection_cost``,
+    and ``net_value`` — the economic score for the schedule.
+    """
     orders = _flatten_orders(result)
     skipped = _flatten_skipped(result)
     total = len(orders) + len(skipped)
@@ -62,7 +70,11 @@ def compute_metrics(result: Dict[str, dict]) -> dict:
     tier0 = sum(1 for o in orders if o.get("tier", 0) == 0)
     tier1 = sum(1 for o in orders if o.get("tier", 0) == 1)
 
-    return {
+    cost_fields: Dict[str, float] = {}
+    if cost_model is not None:
+        cost_fields = cost_model.aggregate(orders, skipped)
+
+    base = {
         "orders_total": total,
         "orders_scheduled": len(orders),
         "orders_skipped": len(skipped),
@@ -79,6 +91,8 @@ def compute_metrics(result: Dict[str, dict]) -> dict:
         "tier0_count": tier0,
         "tier1_count": tier1,
     }
+    base.update(cost_fields)
+    return base
 
 
 _COLUMNS: List[Tuple[str, str, int]] = [

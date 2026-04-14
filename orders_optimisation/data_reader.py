@@ -45,7 +45,7 @@ def is_order_info_line(line):
     """
     order_format = re.compile("^R[0-9]+,[0-9]{4}-[0-1][0-9]-[0-3][0-9] "
                               "[0-2][0-9]:[0-5][0-9]:[0-5][0-9],O[0-9]+"
-                              "(,[BLTV]+)+$")
+                              "(,[BLTV]+)+(,P=[0-9]+)?$")
 
     match = re.match(order_format, line)
     if match is not None:
@@ -88,7 +88,12 @@ def read_restock_info(restock_line):
             raise UnknownIngredientError(
                 "Unknown ingredient '{}' in restock line for branch"
                 " {}".format(key, branch_id))
-        deltas[key] = int(amount)
+        amt = int(amount)
+        if amt < 0:
+            raise ValueError(
+                "restock amount for {} must be non-negative, got {} "
+                "(branch {})".format(key, amt, branch_id))
+        deltas[key] = amt
     return branch_id, ts, deltas
 
 
@@ -144,20 +149,23 @@ def read_order_info(order_info_line):
     Returns:
         Order
     """
-    order_info_split = order_info_line.split(",")
+    order_info_split = order_info_line.rstrip("\n").split(",")
 
-    branch_id, date_time, order_id, *hamburgers_list = order_info_split
+    branch_id, date_time, order_id, *rest = order_info_split
 
-    # remove new line
-    hamburgers_list_no_new_line = [hamburger.rstrip("\n") for hamburger
-                                   in hamburgers_list]
+    # Optional trailing P=<n> priority token.
+    priority = 0
+    if rest and rest[-1].startswith("P="):
+        priority = int(rest[-1][2:])
+        rest = rest[:-1]
 
-    items_list = create_items(hamburgers_list_no_new_line, order_id)
+    items_list = create_items(rest, order_id)
 
     return Order(branch_id=branch_id,
                  date_time=date_time,
                  order_id=order_id,
-                 hamburgers=items_list)
+                 hamburgers=items_list,
+                 priority=priority)
 
 
 def create_items(hamburgers_list_no_new_line, order_id):
